@@ -24,7 +24,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim.swa_utils import AveragedModel, SWALR
 
 # Add parent directory to path
@@ -74,7 +73,7 @@ def train_one_epoch(
     train_loader,
     criterion: LandNetV2Loss,
     optimizer,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
     ema: ModelEMA,
     epoch: int,
     grad_accum_steps: int,
@@ -107,7 +106,7 @@ def train_one_epoch(
         pitch_gt = batch["pitch_sincos"].to(device, non_blocking=True)
 
         # Forward pass with mixed precision
-        with autocast(enabled=config.USE_AMP):
+        with torch.amp.autocast(device_type="cuda", enabled=config.USE_AMP):
             if config.NUM_ANGLES >= 3:
                 yaw_gt = batch["yaw_sincos"].to(device, non_blocking=True)
                 roll_pred, pitch_pred, yaw_pred = model(images)
@@ -196,7 +195,7 @@ def validate(
         roll_gt = batch["roll_sincos"].to(device, non_blocking=True)
         pitch_gt = batch["pitch_sincos"].to(device, non_blocking=True)
 
-        with autocast(enabled=config.USE_AMP):
+        with torch.amp.autocast(device_type="cuda", enabled=config.USE_AMP):
             if config.NUM_ANGLES >= 3:
                 yaw_gt = batch["yaw_sincos"].to(device, non_blocking=True)
                 roll_pred, pitch_pred, yaw_pred = model(images)
@@ -356,7 +355,7 @@ def main():
     ).to(device)
 
     # Mixed precision scaler
-    scaler = GradScaler(enabled=config.USE_AMP)
+    scaler = torch.amp.GradScaler(device_type="cuda", enabled=config.USE_AMP)
 
     # EMA
     ema = ModelEMA(base_model, decay=config.EMA_DECAY)

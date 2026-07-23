@@ -63,7 +63,7 @@ WARMUP_EPOCHS = 5
 MIN_LR = 1e-6
 
 # EMA
-EMA_DECAY = 0.9999
+EMA_DECAY = 0.999
 
 # SWA
 SWA_START_EPOCH = 280    # Last 20 epochs
@@ -122,5 +122,5 @@ LOG_DIR = "logs"
 # =============================================================================
 # Validation
 # =============================================================================
-VAL_SPLIT_RATIO = 0.1   # 10% of train for validation if no val split exists
+VAL_SPLIT_RATIO = 0.15   # 10% of train for validation if no val split exists
 SEED = 42

@@ -56,6 +56,12 @@ class DeiTIIIBackbone(nn.Module):
         self.cls_token = model.cls_token
         self.pos_drop = model.pos_drop
 
+        # Fix timm PatchEmbed strict size checking
+        if hasattr(self.patch_embed, 'img_size'):
+            self.patch_embed.img_size = (img_size, img_size)
+        if hasattr(self.patch_embed, 'strict_img_size'):
+            self.patch_embed.strict_img_size = False
+
         # Determine num_prefix_tokens for interpolation
         self.num_prefix_tokens = getattr(model, 'num_prefix_tokens', 1)
 
