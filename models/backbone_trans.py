@@ -55,9 +55,14 @@ class DeiTIIIBackbone(nn.Module):
         self.cls_token = model.cls_token
         self.pos_drop = model.pos_drop
 
+        # Determine num_prefix_tokens for interpolation
+        self.num_prefix_tokens = getattr(model, 'num_prefix_tokens', 1)
+
         # Interpolate positional embeddings for new image size
         self.pos_embed = nn.Parameter(
-            self._interpolate_pos_embed(model.pos_embed, img_size, patch_size)
+            self._interpolate_pos_embed(
+                model.pos_embed, img_size, patch_size, self.num_prefix_tokens
+            )
         )
 
         # Split transformer blocks into 4 stages
@@ -80,11 +85,21 @@ class DeiTIIIBackbone(nn.Module):
         pos_embed: torch.Tensor,
         new_img_size: int,
         patch_size: int,
+        num_prefix_tokens: int = 1,
     ) -> torch.Tensor:
         """Interpolate positional embeddings for a different image size."""
-        # pos_embed: (1, old_N+1, D) where old_N = (old_img_size/patch_size)²
-        cls_pos = pos_embed[:, :1, :]     # (1, 1, D) - CLS token
-        patch_pos = pos_embed[:, 1:, :]   # (1, old_N, D)
+        total_tokens = pos_embed.shape[1]
+        
+        # Detect if pos_embed includes the prefix (CLS) token
+        grid_size = int(math.sqrt(total_tokens))
+        if grid_size * grid_size == total_tokens:
+            has_prefix = False
+            cls_pos = None
+            patch_pos = pos_embed
+        else:
+            has_prefix = True
+            cls_pos = pos_embed[:, :num_prefix_tokens, :]
+            patch_pos = pos_embed[:, num_prefix_tokens:, :]
 
         old_num_patches = patch_pos.shape[1]
         old_grid = int(old_num_patches ** 0.5)
@@ -103,7 +118,9 @@ class DeiTIIIBackbone(nn.Module):
         )
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, -1)
 
-        return torch.cat([cls_pos, patch_pos], dim=1)
+        if has_prefix:
+            return torch.cat([cls_pos, patch_pos], dim=1)
+        return patch_pos
 
     def forward_embed(self, x: torch.Tensor) -> torch.Tensor:
         """Patch embedding + positional embedding + CLS token."""
@@ -112,12 +129,17 @@ class DeiTIIIBackbone(nn.Module):
         # Patch embedding
         x = self.patch_embed(x)  # (B, N, D)
 
-        # Prepend CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
-        x = torch.cat([cls_tokens, x], dim=1)  # (B, N+1, D)
-
-        # Add positional embedding
-        x = x + self.pos_embed
+        # Handle pos_embed based on whether it has the CLS token embedded
+        if self.pos_embed.shape[1] == x.shape[1]:
+            # pos_embed only contains patch pos embeddings (no CLS)
+            x = x + self.pos_embed
+            cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+            x = torch.cat([cls_tokens, x], dim=1)          # (B, N+1, D)
+        else:
+            # pos_embed includes CLS pos embedding
+            cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+            x = torch.cat([cls_tokens, x], dim=1)          # (B, N+1, D)
+            x = x + self.pos_embed
         x = self.pos_drop(x)
 
         return x

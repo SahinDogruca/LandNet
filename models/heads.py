@@ -98,7 +98,7 @@ class AngleHead(nn.Module):
         nn.init.xavier_uniform_(self.output_proj[-1].weight, gain=0.01)
         nn.init.zeros_(self.output_proj[-1].bias)
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass — always in FP32 regardless of AMP context.

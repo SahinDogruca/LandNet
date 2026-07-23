@@ -48,8 +48,8 @@ AMP_HEAD_FP32 = True  # Force FP32 for regression heads even under AMP
 # Training
 # =============================================================================
 EPOCHS = 300
-BATCH_SIZE = 4           # per GPU (reduced for 768×768 input)
-GRAD_ACCUM_STEPS = 4     # effective batch = 8 * num_gpus * 4
+BATCH_SIZE = 8           # per GPU (reduced for 768×768 input)
+GRAD_ACCUM_STEPS = 2     # effective batch = 8 * num_gpus * 4
 NUM_WORKERS = 4
 
 # Optimizer
