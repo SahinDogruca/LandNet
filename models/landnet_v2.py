@@ -162,15 +162,15 @@ class LandNetV2(nn.Module):
 
     def __init__(
         self,
-        cnn_model_name: str = "convnextv2_base.fcmae_ft_in22k_in1k",
-        trans_model_name: str = "deit3_base_patch16_384.fb_in22k_ft_in1k",
+        cnn_model_name: str = "convnextv2_tiny.fcmae_ft_in22k_in1k",
+        trans_model_name: str = "deit3_small_patch16_384.fb_in22k_ft_in1k",
         pretrained: bool = True,
         img_size: int = 768,
         fib_heads: int = 8,
         fib_spatial_size: int = None,  # Auto: img_size // patch_size
         fib_dropout: float = 0.1,
         acfb_reduction: int = 16,
-        head_hidden_dim: int = 2048,
+        head_hidden_dim: int = 1024,
         head_dropout: tuple = (0.3, 0.2, 0.1),
         head_normalize: bool = True,
         num_angles: int = 3,

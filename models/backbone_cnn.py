@@ -4,11 +4,11 @@ ConvNeXt-V2-Base Backbone Wrapper
 Extracts multi-scale features from 4 stages for FIB interaction.
 Pretrained on ImageNet-22k → fine-tuned on ImageNet-1k.
 
-Stage outputs for 512×512 input:
-    Stage 0: (B, 128, 128, 128)
-    Stage 1: (B, 256,  64,  64)
-    Stage 2: (B, 512,  32,  32)
-    Stage 3: (B, 1024, 16,  16)
+Stage outputs for 512×512 input (Tiny):
+    Stage 0: (B, 96,  128, 128)
+    Stage 1: (B, 192, 64,  64)
+    Stage 2: (B, 384, 32,  32)
+    Stage 3: (B, 768, 16,  16)
 """
 import torch
 import torch.nn as nn
@@ -30,7 +30,7 @@ class ConvNeXtV2Backbone(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "convnextv2_base.fcmae_ft_in22k_in1k",
+        model_name: str = "convnextv2_tiny.fcmae_ft_in22k_in1k",
         pretrained: bool = True,
     ):
         super().__init__()
@@ -43,7 +43,7 @@ class ConvNeXtV2Backbone(nn.Module):
         self.stages = model.stages      # 4 ConvNeXtStage modules
 
         # Store channel dims for each stage
-        self.channels = [128, 256, 512, 1024]
+        self.channels = [96, 192, 384, 768]
 
         # Remove classification head (not needed)
         del model
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     for i, f in enumerate(features):
         print(f"Stage {i}: {f.shape}")
     # Expected:
-    # Stage 0: torch.Size([1, 128, 128, 128])
-    # Stage 1: torch.Size([1, 256, 64, 64])
-    # Stage 2: torch.Size([1, 512, 32, 32])
-    # Stage 3: torch.Size([1, 1024, 16, 16])
+    # Stage 0: torch.Size([1, 96, 128, 128])
+    # Stage 1: torch.Size([1, 192, 64, 64])
+    # Stage 2: torch.Size([1, 384, 32, 32])
+    # Stage 3: torch.Size([1, 768, 16, 16])

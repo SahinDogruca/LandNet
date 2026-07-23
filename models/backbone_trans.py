@@ -5,10 +5,10 @@ Extracts intermediate Transformer features at 4 stage boundaries
 for FIB interaction with CNN branch.
 
 Splits 12 Transformer blocks into 4 groups of 3:
-    Stage 0: Blocks  0-2  → (B, N+1, 768)
-    Stage 1: Blocks  3-5  → (B, N+1, 768)
-    Stage 2: Blocks  6-8  → (B, N+1, 768)
-    Stage 3: Blocks  9-11 → (B, N+1, 768)
+    Stage 0: Blocks  0-2  → (B, N+1, 384)
+    Stage 1: Blocks  3-5  → (B, N+1, 384)
+    Stage 2: Blocks  6-8  → (B, N+1, 384)
+    Stage 3: Blocks  9-11 → (B, N+1, 384)
 
 Where N = (img_size / patch_size)² = (512/16)² = 1024 patches.
 The +1 is for the CLS token.
@@ -26,7 +26,7 @@ except ImportError:
 
 class DeiTIIIBackbone(nn.Module):
     """
-    DeiT-III-Base backbone with stage-by-stage feature extraction.
+    DeiT-III-Small backbone with stage-by-stage feature extraction.
 
     Handles positional embedding interpolation for 512×512 input
     (DeiT-III is pretrained at 384×384 → pos_embed resized to 512).
@@ -34,7 +34,7 @@ class DeiTIIIBackbone(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "deit3_base_patch16_384.fb_in22k_ft_in1k",
+        model_name: str = "deit3_small_patch16_384.fb_in22k_ft_in1k",
         pretrained: bool = True,
         img_size: int = 512,
         patch_size: int = 16,
@@ -43,7 +43,7 @@ class DeiTIIIBackbone(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
-        self.embed_dim = 768
+        self.embed_dim = 384
         self.num_patches = (img_size // patch_size) ** 2  # 1024
         self.grid_size = img_size // patch_size            # 32
         self.blocks_per_stage = blocks_per_stage
