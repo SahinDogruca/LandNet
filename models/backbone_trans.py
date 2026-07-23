@@ -16,6 +16,7 @@ The +1 is for the CLS token.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 try:
     import timm
