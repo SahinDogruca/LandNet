@@ -9,17 +9,17 @@ import math
 # =============================================================================
 # Model Architecture
 # =============================================================================
-INPUT_SIZE = 768
+INPUT_SIZE = 512
 
-# CNN Backbone (ConvNeXt-V2-Base)
-CNN_BACKBONE = "convnextv2_base.fcmae_ft_in22k_in1k"
-CNN_CHANNELS = [128, 256, 512, 1024]  # Stage output channels
+# CNN Backbone (ConvNeXt-V2-Tiny)
+CNN_BACKBONE = "convnextv2_tiny.fcmae_ft_in22k_in1k"
+CNN_CHANNELS = [96, 192, 384, 768]  # Stage output channels
 
-# Transformer Backbone (DeiT-III-Base)
-TRANS_BACKBONE = "deit3_base_patch16_384.fb_in22k_ft_in1k"
-TRANS_EMBED_DIM = 768
+# Transformer Backbone (DeiT-III-Small)
+TRANS_BACKBONE = "deit3_small_patch16_384.fb_in22k_ft_in1k"
+TRANS_EMBED_DIM = 384
 TRANS_DEPTH = 12
-TRANS_NUM_HEADS = 12
+TRANS_NUM_HEADS = 6
 TRANS_PATCH_SIZE = 16
 
 # FIB (Feature Interactive Block)
@@ -31,7 +31,7 @@ FIB_DROPOUT = 0.1
 ACFB_REDUCTION = 16  # ECA-Net reduction ratio
 
 # Regression Heads
-HEAD_HIDDEN_DIM = 2048
+HEAD_HIDDEN_DIM = 1024
 HEAD_DROPOUT = 0.3
 UNIT_CIRCLE_NORMALIZE = True  # Normalize output to sin²+cos²=1
 

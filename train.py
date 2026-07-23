@@ -268,8 +268,8 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default=config.CHECKPOINT_DIR)
     parser.add_argument("--log_dir", type=str, default=config.LOG_DIR)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                        help="Enable gradient checkpointing (default: True for 768+)")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=False,
+                        help="Enable gradient checkpointing to save VRAM (at the cost of speed)")
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=config.SEED)
     args = parser.parse_args()
