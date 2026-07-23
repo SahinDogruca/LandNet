@@ -80,7 +80,7 @@ class DeiTIIIBackbone(nn.Module):
         self.stage1 = nn.Sequential(*all_blocks[3:6])
         self.stage2 = nn.Sequential(*all_blocks[6:9])
         self.stage3 = nn.Sequential(*all_blocks[9:12])
-        self.stages = [self.stage0, self.stage1, self.stage2, self.stage3]
+        self.stages = nn.ModuleList([self.stage0, self.stage1, self.stage2, self.stage3])
 
         self.norm = model.norm  # Final LayerNorm
 
