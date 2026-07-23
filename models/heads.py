@@ -98,7 +98,6 @@ class AngleHead(nn.Module):
         nn.init.xavier_uniform_(self.output_proj[-1].weight, gain=0.01)
         nn.init.zeros_(self.output_proj[-1].bias)
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass — always in FP32 regardless of AMP context.
@@ -174,9 +173,11 @@ class AngleHeads(nn.Module):
         # Global Average Pooling → FP32 cast for precision
         x = self.pool(x).flatten(1).float()
 
-        roll = self.roll_head(x)
-        pitch = self.pitch_head(x)
-        yaw = self.yaw_head(x) if self.num_angles >= 3 else None
+        # Disable autocast to ensure all head layers run in pure FP32
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            roll = self.roll_head(x)
+            pitch = self.pitch_head(x)
+            yaw = self.yaw_head(x) if self.num_angles >= 3 else None
 
         return roll, pitch, yaw
 
