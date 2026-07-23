@@ -355,7 +355,7 @@ def main():
     ).to(device)
 
     # Mixed precision scaler
-    scaler = torch.amp.GradScaler(device_type="cuda", enabled=config.USE_AMP)
+    scaler = torch.amp.GradScaler("cuda", enabled=config.USE_AMP)
 
     # EMA
     ema = ModelEMA(base_model, decay=config.EMA_DECAY)
