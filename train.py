@@ -150,13 +150,7 @@ def train_one_epoch(
             meters["yaw_mae"].update(loss_dict["yaw_mae_deg"].item(), bs)
 
         # Log progress to tqdm
-        desc = (
-            f"Epoch {epoch} | Loss: {meters['loss'].avg:.4f} | "
-            f"Roll: {meters['roll_mae'].avg:.2f}° | "
-            f"Pitch: {meters['pitch_mae'].avg:.2f}°"
-        )
-        if config.NUM_ANGLES >= 3:
-            desc += f" | Yaw: {meters['yaw_mae'].avg:.2f}°"
+        desc = f"Loss: {loss_dict['total'].item():.4f} | Pitch: {loss_dict['pitch_mae_deg'].item():.2f}°"
         pbar.set_description(desc)
 
     return {k: v.avg for k, v in meters.items()}
@@ -427,27 +421,40 @@ def main():
             scheduler.step()
 
         # ============================================================
-        # Validate (with EMA weights)
+        # Validate
         # ============================================================
-        ema.apply_shadow(base_model)
         val_metrics = validate(model, val_loader, criterion, device)
-        ema.restore(base_model)
+
+        if ema is not None:
+            ema.apply_shadow(base_model)
+            val_ema_metrics = validate(model, val_loader, criterion, device)
+            ema.restore(base_model)
+        else:
+            val_ema_metrics = None
 
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]["lr"]
 
-        log_str = (
-            f"Epoch [{epoch}/{args.epochs}] ({epoch_time:.1f}s) | "
-            f"LR: {current_lr:.2e} | "
-            f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Val Loss: {val_metrics['loss']:.6f} | "
-            f"Roll MAE: {val_metrics['roll_mae']:.4f}° (p99: {val_metrics['roll_p99']:.4f}°) | "
-            f"Pitch MAE: {val_metrics['pitch_mae']:.4f}° (p99: {val_metrics['pitch_p99']:.4f}°)"
-        )
+        logger.info(f"--- Epoch {epoch} Summary ({epoch_time:.1f}s) | LR: {current_lr:.2e} ---")
+        
+        # Train Summary
+        train_str = f"Train     | Loss: {train_metrics['loss']:.4f} | Roll: {train_metrics['roll_mae']:.4f}° | Pitch: {train_metrics['pitch_mae']:.4f}°"
         if config.NUM_ANGLES >= 3:
-            log_str += f" | Yaw MAE: {val_metrics['yaw_mae']:.4f}° (p99: {val_metrics['yaw_p99']:.4f}°)"
-            
-        logger.info(log_str)
+            train_str += f" | Yaw: {train_metrics['yaw_mae']:.4f}°"
+        logger.info(train_str)
+        
+        # Val Summary
+        val_str = f"Val       | Loss: {val_metrics['loss']:.4f} | Roll: {val_metrics['roll_mae']:.4f}° | Pitch: {val_metrics['pitch_mae']:.4f}°"
+        if config.NUM_ANGLES >= 3:
+            val_str += f" | Yaw: {val_metrics['yaw_mae']:.4f}°"
+        logger.info(val_str)
+
+        # Val EMA Summary
+        if val_ema_metrics is not None:
+            ema_str = f"Val (EMA) | Loss: {val_ema_metrics['loss']:.4f} | Roll: {val_ema_metrics['roll_mae']:.4f}° | Pitch: {val_ema_metrics['pitch_mae']:.4f}°"
+            if config.NUM_ANGLES >= 3:
+                ema_str += f" | Yaw: {val_ema_metrics['yaw_mae']:.4f}°"
+            logger.info(ema_str)
 
         # ============================================================
         # Save checkpoints
