@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv/
+
+# PyTorch and Checkpoints
+checkpoints/
+logs/
+*.pth
+*.pt
+*.ckpt
+
+# Dataset Cache
+.cache/
+huggingface/
+datasets/
+
+# Logs
+*.log
+runs/
+tensorboard/

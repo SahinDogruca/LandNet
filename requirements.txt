@@ -1,0 +1,17 @@
+# PyTorch (CUDA 13.2 uyumlu)
+# Not: PyTorch henüz resmi olarak cu132 paketi yayınlamadı, ancak CUDA geriye dönük uyumlu
+# olduğu için cu124 paketleri CUDA 13.2 üzerinde sorunsuz ve tam performanslı çalışır.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.5.0
+torchvision>=0.20.0
+
+# Modeller ve Mimari
+timm>=1.0.3      # ConvNeXt-V2 ve DeiT-III modellerini barındırır
+
+# Veri Seti
+datasets>=2.16.1 # Hugging Face dataset (LARD_V2 için)
+Pillow>=10.2.0   # Görüntü işleme
+
+# Araçlar
+numpy>=1.26.0
+tqdm>=4.66.1
