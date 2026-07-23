@@ -52,6 +52,7 @@ class CoordinateAttention(nn.Module):
         self.conv_w = nn.Conv2d(mid_channels, channels, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous()
         B, C, H, W = x.shape
 
         # Directional pooling
@@ -101,6 +102,7 @@ class ECAAttention(nn.Module):
         Returns:
             Channel-attended feature map (B, C, H, W)
         """
+        x = x.contiguous()
         B, C, H, W = x.shape
 
         # Global average pooling → (B, C, 1)
@@ -135,7 +137,10 @@ class GatedFusion(nn.Module):
         )
 
     def forward(self, f_a: torch.Tensor, f_b: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.gate_conv(torch.cat([f_a, f_b], dim=1)))
+        f_a = f_a.contiguous()
+        f_b = f_b.contiguous()
+        f_cat = torch.cat([f_a, f_b], dim=1).contiguous()
+        gate = torch.sigmoid(self.gate_conv(f_cat))
         return gate * f_a + (1.0 - gate) * f_b
 
 
@@ -206,6 +211,8 @@ class ACFB(nn.Module):
         Returns:
             Fused feature map (B, output_channels, H_cnn, W_cnn)
         """
+        f_cnn = f_cnn.contiguous()
+        f_trans = f_trans.contiguous()
         B, C_cnn, H_cnn, W_cnn = f_cnn.shape
 
         # ============================================================
@@ -213,7 +220,7 @@ class ACFB(nn.Module):
         # ============================================================
         # Remove CLS token, reshape to spatial grid
         patch_tokens = f_trans[:, 1:, :]  # (B, N, D)
-        f_trans_spatial = patch_tokens.transpose(1, 2).reshape(
+        f_trans_spatial = patch_tokens.transpose(1, 2).contiguous().view(
             B, -1, self.trans_grid_size, self.trans_grid_size
         )  # (B, D, 32, 32)
 
