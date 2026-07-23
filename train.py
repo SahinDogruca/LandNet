@@ -20,6 +20,7 @@ import math
 import time
 import argparse
 import logging
+from tqdm import tqdm
 from pathlib import Path
 
 import torch
@@ -100,7 +101,8 @@ def train_one_epoch(
     num_batches = len(train_loader)
     start_time = time.time()
 
-    for batch_idx, batch in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
+    for batch_idx, batch in enumerate(pbar):
         images = batch["image"].to(device, non_blocking=True)
         roll_gt = batch["roll_sincos"].to(device, non_blocking=True)
         pitch_gt = batch["pitch_sincos"].to(device, non_blocking=True)
@@ -147,19 +149,15 @@ def train_one_epoch(
         if config.NUM_ANGLES >= 3:
             meters["yaw_mae"].update(loss_dict["yaw_mae_deg"].item(), bs)
 
-        # Log progress
-        if (batch_idx + 1) % max(1, num_batches // 5) == 0:
-            elapsed = time.time() - start_time
-            log_str = (
-                f"  Epoch [{epoch}] [{batch_idx+1}/{num_batches}] "
-                f"Loss: {meters['loss'].avg:.6f} | "
-                f"Roll: {meters['roll_mae'].avg:.4f}° | "
-                f"Pitch: {meters['pitch_mae'].avg:.4f}°"
-            )
-            if config.NUM_ANGLES >= 3:
-                log_str += f" | Yaw: {meters['yaw_mae'].avg:.4f}°"
-            log_str += f" | Time: {elapsed:.1f}s"
-            logger.info(log_str)
+        # Log progress to tqdm
+        desc = (
+            f"Epoch {epoch} | Loss: {meters['loss'].avg:.4f} | "
+            f"Roll: {meters['roll_mae'].avg:.2f}° | "
+            f"Pitch: {meters['pitch_mae'].avg:.2f}°"
+        )
+        if config.NUM_ANGLES >= 3:
+            desc += f" | Yaw: {meters['yaw_mae'].avg:.2f}°"
+        pbar.set_description(desc)
 
     return {k: v.avg for k, v in meters.items()}
 
@@ -190,7 +188,8 @@ def validate(
     all_pitch_sin_gt, all_pitch_cos_gt = [], []
     all_yaw_sin_gt, all_yaw_cos_gt = [], []
 
-    for batch in val_loader:
+    pbar = tqdm(val_loader, desc="Validating", leave=False)
+    for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
         roll_gt = batch["roll_sincos"].to(device, non_blocking=True)
         pitch_gt = batch["pitch_sincos"].to(device, non_blocking=True)
