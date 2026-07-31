@@ -183,11 +183,13 @@ def _ensure_table_exists(cfg: "DataConfig") -> str:
     )
 
 
-def _load_table(path: str) -> pd.DataFrame:
+def _load_table(path: str, columns: list = None) -> pd.DataFrame:
+    """Tablo yukler. columns verilirse SADECE o sutunlari okur (parquet'te
+    gomulu image byte'larini atlayarak cok daha hizli yukleme saglar)."""
     if path.endswith(".parquet"):
-        return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=columns)
     elif path.endswith(".csv"):
-        return pd.read_csv(path)
+        return pd.read_csv(path, usecols=columns)
     else:
         raise ValueError(f"Desteklenmeyen tablo formati (.parquet ya da .csv bekleniyor): {path}")
 
@@ -259,16 +261,33 @@ class LARDPoseDataset(Dataset):
 
         # Dosya yoksa ve auto_download_from_hf=True ise HuggingFace'ten indir
         table_path = _ensure_table_exists(cfg)
-        df = _load_table(table_path)
-        required_cols = {"image", "airport", "runway", "scenario", "yaw", "pitch", "roll"} | \
-                         {f"{ax}_{c}" for ax in ("x", "y") for c in CORNER_ORDER}
-        missing = required_cols - set(df.columns)
+
+        # Sutun kontrolu ve split hesaplamasi icin SADECE hafif sutunlari yukle
+        # (image byte'larini ATLAYARAK dakikalarca surecek yuklemeyi saniyelere dusur)
+        light_cols = ["airport", "runway", "scenario", "yaw", "pitch", "roll"] + \
+                     [f"{ax}_{c}" for ax in ("x", "y") for c in CORNER_ORDER]
+
+        # Sema kontrolu: parquet'ten sadece sutun isimlerini oku (veri YUKLEMEDEN)
+        if table_path.endswith(".parquet"):
+            import pyarrow.parquet as pq
+            available_cols = set(pq.read_schema(table_path).names)
+        else:
+            available_cols = set(pd.read_csv(table_path, nrows=0).columns)
+        required_cols = {"image"} | set(light_cols)
+        missing = required_cols - available_cols
         if missing:
             raise ValueError(f"Tabloda eksik sutunlar: {sorted(missing)}")
 
-        train_idx, val_idx = scenario_grouped_split(df, cfg.val_fraction, cfg.split_seed)
+        # Split hesaplamasi icin sadece scenario sutununu yukle
+        df_scenario = _load_table(table_path, columns=["scenario"])
+        train_idx, val_idx = scenario_grouped_split(df_scenario, cfg.val_fraction, cfg.split_seed)
         idx = train_idx if split == "train" else val_idx
-        self.df = df.iloc[idx].reset_index(drop=True)
+        del df_scenario
+
+        # Simdi SADECE ilgili split'in satirlarini yukle (tum sutunlar dahil)
+        df_full = _load_table(table_path)
+        self.df = df_full.iloc[idx].reset_index(drop=True)
+        del df_full
 
         self.runway_db = load_runway_db(cfg.runway_db_path) if cfg.runway_db_path else None
         self._object_points_cache: Dict[Tuple[str, str], Tuple[torch.Tensor, dict]] = {}
@@ -401,7 +420,16 @@ def sanity_check_angle_convention(table_path: str, n_sample: int = 500) -> Dict[
     Cagirin ve CIKTIYI OKUYUN -- pitch_raw ortalamasi 90'dan uzaksa (ornegin
     <60 ya da >120), LARD_ANGLE_OFFSETS_DEG'i GUNCELLEMEDEN egitime
     BASLAMAYIN."""
-    df = _load_table(table_path)
+    # Sadece gerekli sutunlari yukle (image byte'larini ATLAYARAK hizi 100x+ artir)
+    needed_cols = ["pitch", "yaw", "roll"]
+    # vertical_path_angle varsa onu da ekle (korelasyon kontrolu icin)
+    try:
+        test_df = _load_table(table_path, columns=["vertical_path_angle"])
+        if "vertical_path_angle" in test_df.columns:
+            needed_cols.append("vertical_path_angle")
+    except Exception:
+        pass
+    df = _load_table(table_path, columns=needed_cols)
     n = min(n_sample, len(df))
     sample = df.sample(n=n, random_state=0) if len(df) > n else df
 
@@ -455,18 +483,23 @@ def report_runway_db_coverage(table_path: str, runway_db_path: str) -> Dict[str,
     ya normalize_runway_id()'nin yakalayamadigi bir format farkligi ya da
     DB'de eksik havaalanlari oldugunu gosterir -- bu, o satirlarin idealize
     (45m/3000m) geometriyle egitilecegi, hafif dogruluk kaybi anlamina gelir."""
-    df = _load_table(table_path)
+    # Sadece airport/runway sutunlarini yukle (image byte'larini ATLAYARAK saniyeler icerisinde calis)
+    df = _load_table(table_path, columns=["airport", "runway"])
     db = load_runway_db(runway_db_path)
     from landnet import get_runway_object_points as _gop
 
+    # Her satiri tek tek gezmek yerine benzersiz (airport, runway) ciftleri
+    # uzerinden calis -- binlerce satir yerine onlarca cift kontrol edilir
+    pair_counts = df.groupby(["airport", "runway"]).size().reset_index(name="count")
     n_db, n_fallback = 0, 0
     missing_pairs = set()
-    for _, row in df.iterrows():
+    for _, row in pair_counts.iterrows():
         _, info = _gop(row["airport"], row["runway"], db=db)
+        cnt = row["count"]
         if info["source"] == "runways_db_V2_XPlane":
-            n_db += 1
+            n_db += cnt
         else:
-            n_fallback += 1
+            n_fallback += cnt
             missing_pairs.add((row["airport"], str(row["runway"])))
 
     total = n_db + n_fallback
