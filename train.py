@@ -239,17 +239,22 @@ def train(cfg: TrainConfig):
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
 
-    # --- Veri once ACI KONVANSIYONU + RUNWAY DB KAPSAMA raporlanir (guvenlik) ---
-    print("\n[1/5] Aci konvansiyonu ve runway DB kapsama kontrolleri calistiriliyor...")
-    sanity_check_angle_convention(cfg.table_path)
-    report_runway_db_coverage(cfg.table_path, cfg.runway_db_path)
-
+    # --- Veri kumesi: dosya yoksa HuggingFace'ten otomatik indir ---
     data_cfg = DataConfig(
         table_path=cfg.table_path, runway_db_path=cfg.runway_db_path,
         images_root=cfg.images_root,
         img_size=cfg.img_size, hfov_deg=cfg.hfov_deg, val_fraction=cfg.val_fraction,
         split_seed=cfg.seed, angle_offsets=cfg.angle_offsets,
     )
+    # Dosya yoksa HuggingFace'ten indir (DataConfig.auto_download_from_hf=True ise)
+    from landnet_data import _ensure_table_exists
+    resolved_table_path = _ensure_table_exists(data_cfg)
+
+    # --- ACI KONVANSIYONU + RUNWAY DB KAPSAMA raporlanir (guvenlik) ---
+    print("\n[1/5] Aci konvansiyonu ve runway DB kapsama kontrolleri calistiriliyor...")
+    sanity_check_angle_convention(resolved_table_path)
+    report_runway_db_coverage(resolved_table_path, cfg.runway_db_path)
+
     train_ds = LARDPoseDataset(data_cfg, split="train")
     val_ds = LARDPoseDataset(data_cfg, split="val")
     print(f"[2/5] Veri kumesi: train={len(train_ds)}  val={len(val_ds)}")
