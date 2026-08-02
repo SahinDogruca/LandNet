@@ -46,6 +46,7 @@ from typing import Optional, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from landnet import (
     LandNetConfig, LandNet, LandNetLoss, PoseMetricLogger, refine_rotation,
@@ -184,7 +185,8 @@ def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, devic
     refined_logger = PoseMetricLogger() if run_refinement else None
     total_loss, total_loss_rot, total_loss_reproj, n_batches = 0.0, 0.0, 0.0, 0
 
-    for bi, batch in enumerate(loader):
+    pbar = tqdm(loader, desc="  [val]", leave=False, dynamic_ncols=True)
+    for bi, batch in enumerate(pbar):
         batch = _to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
             pred = model(batch["image"])
@@ -317,7 +319,8 @@ def train(cfg: TrainConfig):
           f"(efektif batch={cfg.batch_size * cfg.grad_accum_steps})\n")
 
     global_step = start_epoch * steps_per_epoch
-    for epoch in range(start_epoch, cfg.epochs):
+    epoch_pbar = tqdm(range(start_epoch, cfg.epochs), desc="Epoch", dynamic_ncols=True)
+    for epoch in epoch_pbar:
         model.train()
         epoch_t0 = time.time()
         use_reproj_this_epoch = epoch >= cfg.reproj_warmup_epochs
@@ -326,7 +329,8 @@ def train(cfg: TrainConfig):
         n_finite_steps, n_skipped_steps = 0, 0
 
         optimizer.zero_grad(set_to_none=True)
-        for step, batch in enumerate(train_loader):
+        batch_pbar = tqdm(train_loader, desc=f"  Epoch {epoch}", leave=False, dynamic_ncols=True)
+        for step, batch in enumerate(batch_pbar):
             batch = _to_device(batch, device)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
@@ -367,6 +371,11 @@ def train(cfg: TrainConfig):
             running_rot += out["loss_rotation"].item()
             running_reproj += out.get("loss_reprojection", torch.tensor(0.0)).item()
 
+            # tqdm postfix guncelle
+            avg_loss = running_loss / (step + 1)
+            avg_rot = running_rot / (step + 1)
+            batch_pbar.set_postfix(loss=f"{avg_loss:.4f}", rot=f"{avg_rot:.4f}", skip=n_skipped_steps)
+
         n_batches = len(train_loader)
         train_metrics = {
             "epoch": epoch,
@@ -378,7 +387,13 @@ def train(cfg: TrainConfig):
             "lr": scheduler.get_last_lr()[0],
             "epoch_time_sec": time.time() - epoch_t0,
         }
-        print(f"[epoch {epoch:4d}/{cfg.epochs}] loss={train_metrics['train_loss']:.6f} "
+        epoch_pbar.set_postfix(
+            loss=f"{train_metrics['train_loss']:.4f}",
+            rot=f"{train_metrics['train_loss_rotation']:.4f}",
+            lr=f"{train_metrics['lr']:.1e}",
+            t=f"{train_metrics['epoch_time_sec']:.0f}s",
+        )
+        tqdm.write(f"[epoch {epoch:4d}/{cfg.epochs}] loss={train_metrics['train_loss']:.6f} "
               f"rot={train_metrics['train_loss_rotation']:.6f} "
               f"reproj={train_metrics['train_loss_reprojection']:.6f} "
               f"(aktif={use_reproj_this_epoch}) lr={train_metrics['lr']:.2e} "
@@ -390,14 +405,14 @@ def train(cfg: TrainConfig):
             run_refine = ((epoch + 1) % cfg.refine_eval_every == 0) or (epoch == cfg.epochs - 1)
             val_metrics = validate(model, criterion, val_loader, device, amp_dtype,
                                     run_refinement=run_refine, refine_max_batches=cfg.refine_eval_max_batches)
-            print(f"  [val] loss={val_metrics['val_loss']:.6f} "
+            tqdm.write(f"  [val] loss={val_metrics['val_loss']:.6f} "
                   f"geodesic_MAE={val_metrics['raw_geodesic_mae_deg']:.4f} deg "
                   f"geodesic_RMSE={val_metrics['raw_geodesic_rmse_deg']:.4f} deg")
-            print(f"        yaw_RMSE={val_metrics['raw_yaw_rmse_deg']:.4f} "
+            tqdm.write(f"        yaw_RMSE={val_metrics['raw_yaw_rmse_deg']:.4f} "
                   f"pitch_RMSE={val_metrics['raw_pitch_rmse_deg']:.4f} "
                   f"roll_RMSE={val_metrics['raw_roll_rmse_deg']:.4f} (derece)")
             if run_refine:
-                print(f"  [val+refine] geodesic_RMSE={val_metrics['refined_geodesic_rmse_deg']:.4f} deg "
+                tqdm.write(f"  [val+refine] geodesic_RMSE={val_metrics['refined_geodesic_rmse_deg']:.4f} deg "
                       f"(ham modelden fark: "
                       f"{val_metrics['raw_geodesic_rmse_deg'] - val_metrics['refined_geodesic_rmse_deg']:+.4f} deg)")
             log_entry.update(val_metrics)
@@ -406,7 +421,7 @@ def train(cfg: TrainConfig):
                 best_val_geodesic = val_metrics["raw_geodesic_rmse_deg"]
                 _save_checkpoint(cfg, model, optimizer, scheduler, criterion, ema, epoch,
                                   best_val_geodesic, os.path.join(cfg.output_dir, "best.pt"))
-                print(f"  -> YENI EN IYI model kaydedildi (geodesic_RMSE={best_val_geodesic:.4f} deg)")
+                tqdm.write(f"  -> YENI EN IYI model kaydedildi (geodesic_RMSE={best_val_geodesic:.4f} deg)")
 
         with open(history_path, "a") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
