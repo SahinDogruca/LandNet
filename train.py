@@ -254,7 +254,7 @@ def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, devic
     refined_logger = PoseMetricLogger() if run_refinement else None
     total_loss, total_loss_rot, total_loss_reproj, n_batches = 0.0, 0.0, 0.0, 0
 
-    pbar = tqdm(loader, desc=f"  [{desc_suffix}]", leave=False, dynamic_ncols=True,
+    pbar = tqdm(loader, desc=f"  [{desc_suffix}]", leave=False, ncols=120,
                 disable=not is_main(rank))
     for bi, batch in enumerate(pbar):
         batch = _to_device(batch, device)
@@ -433,7 +433,7 @@ def train(cfg: TrainConfig):
 
         optimizer.zero_grad(set_to_none=True)
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{cfg.epochs} [Train]",
-                          leave=False, dynamic_ncols=True, disable=not is_main(rank))
+                          leave=False, ncols=120, disable=not is_main(rank))
 
         for step, batch in enumerate(train_pbar):
             batch = _to_device(batch, device)
@@ -481,7 +481,7 @@ def train(cfg: TrainConfig):
 
             train_pbar.set_postfix(
                 loss=f"{running_loss / (step + 1):.4f}",
-                rot=f"{running_rot / (step + 1):.4f}",
+                rot_loss=f"{running_rot / (step + 1):.4f}",
                 skip=n_skipped_steps,
             )
 
