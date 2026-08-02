@@ -137,8 +137,9 @@ def setup_ddp() -> tuple:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
 
     return rank, local_rank, world_size, True
 
@@ -339,7 +340,7 @@ def train(cfg: TrainConfig):
         sanity_check_angle_convention(resolved_table_path)
         report_runway_db_coverage(resolved_table_path, cfg.runway_db_path)
     if is_ddp:
-        dist.barrier()  # rank 0 indirme/kontrol bitene kadar bekle
+        dist.barrier(device_ids=[local_rank])  # rank 0 indirme/kontrol bitene kadar bekle
 
     train_ds = LARDPoseDataset(data_cfg, split="train")
     val_ds = LARDPoseDataset(data_cfg, split="val")
@@ -536,7 +537,7 @@ def train(cfg: TrainConfig):
                                       best_val_geodesic, os.path.join(cfg.output_dir, "best.pt"))
 
             if is_ddp:
-                dist.barrier()  # rank 0 val bitene kadar bekle
+                dist.barrier(device_ids=[local_rank])  # rank 0 val bitene kadar bekle
 
         # --- DETAYLI METRİK ÇIKTISI (Sadece rank 0, Tqdm bar'ları silindikten sonra temiz çıktı) ---
         if is_main(rank):

@@ -986,101 +986,84 @@ def solve_translation_given_rotation(R: torch.Tensor, K: torch.Tensor,
     translation t'yi KAPALI-FORM (linear least-squares, DLT tarzi) cozer.
     Boylece network t'yi hic ogrenmek zorunda kalmaz; t geometriden turetilir.
 
-    R: (B,3,3)   K: (3,3) ya da (B,3,3)   points_3d: (N,3) ya da (B,N,3)
-    points_2d: (B,N,2) -- piksel koordinatlari
-    Donus: t (B,3)
-
-    Turetim: lambda_i*[u_i,v_i,1]^T = K(R P_i + t) her nokta icin.
-    M_i = K @ (R @ P_i) olsun. lambda_i = M_i[2] + (K t)[2] (3. satirdan).
-    Bunu 1. ve 2. satirlara yerlestirip duzenlersek, her nokta icin 2 lineer
-    denklem elde ederiz:
-        (K[0,:] - u_i*K[2,:]) @ t = u_i*M_i[2] - M_i[0]
-        (K[1,:] - v_i*K[2,:]) @ t = v_i*M_i[2] - M_i[1]
-    N nokta icin 2N denklem, 3 bilinmeyen (t) -- lstsq ile cozulur.
+    AMP / bfloat16 / float16 altinda linalg.solve dtype uyumsuzlugunu ve
+    sayisal kararsizligi onlemek icin tum girdiler float32'ye zorlanir.
     """
-    B = R.shape[0]
+    orig_dtype = R.dtype
+    device = R.device
+    with torch.autocast(device_type=device.type, enabled=False):
+        R_f = R.float()
+        K_f = K.float()
+        p3d_f = points_3d.float()
+        p2d_f = points_2d.float()
 
-    if K.dim() == 2:
-        K = K.unsqueeze(0).expand(B, -1, -1)
-    if points_3d.dim() == 2:
-        points_3d = points_3d.unsqueeze(0).expand(B, -1, -1)
+        B = R_f.shape[0]
 
-    M = torch.einsum("bij,bjk,bnk->bni", K, R, points_3d)   # (B, N, 3) = K @ (R @ P_i)
+        if K_f.dim() == 2:
+            K_f = K_f.unsqueeze(0).expand(B, -1, -1)
+        if p3d_f.dim() == 2:
+            p3d_f = p3d_f.unsqueeze(0).expand(B, -1, -1)
 
-    u = points_2d[..., 0]  # (B, N)
-    v = points_2d[..., 1]
+        M = torch.einsum("bij,bjk,bnk->bni", K_f, R_f, p3d_f)   # (B, N, 3) = K @ (R @ P_i)
 
-    K0 = K[:, 0:1, :]  # (B,1,3)
-    K1 = K[:, 1:2, :]
-    K2 = K[:, 2:3, :]
+        u = p2d_f[..., 0]  # (B, N)
+        v = p2d_f[..., 1]
 
-    A_u = K0 - u.unsqueeze(-1) * K2       # (B, N, 3)
-    A_v = K1 - v.unsqueeze(-1) * K2       # (B, N, 3)
-    A = torch.cat([A_u, A_v], dim=1)      # (B, 2N, 3)
+        K0 = K_f[:, 0:1, :]  # (B,1,3)
+        K1 = K_f[:, 1:2, :]
+        K2 = K_f[:, 2:3, :]
 
-    b_u = u * M[..., 2] - M[..., 0]       # (B, N)
-    b_v = v * M[..., 2] - M[..., 1]       # (B, N)
-    b = torch.cat([b_u, b_v], dim=1).unsqueeze(-1)   # (B, 2N, 1)
+        A_u = K0 - u.unsqueeze(-1) * K2       # (B, N, 3)
+        A_v = K1 - v.unsqueeze(-1) * K2       # (B, N, 3)
+        A = torch.cat([A_u, A_v], dim=1)      # (B, 2N, 3)
 
-    # Ridge-regularized normal equations: (A^T A + ridge*I) t = A^T b
-    # NOT: pist koseleri duzlemsel (Z=0) oldugu icin klasik PnP'de bilinen bir
-    # "dejenere/near-singular" konfigurasyondur -- ozellikle R henuz egitilmemis
-    # (rastgele/yanlis) oldugunda bu, cok kucuk singular degerlerden dolayi
-    # asiri buyuk/kararsiz t degerlerine (ve dolayisiyla patlayan loss'a) yol
-    # acabilir. Kucuk bir ridge terimi bunu sayisal olarak stabilize eder ve
-    # egitimin erken asamalarinda NaN/Inf gradyan riskini onemli olcude azaltir.
-    AtA = A.transpose(-2, -1) @ A                                   # (B, 3, 3)
-    Atb = A.transpose(-2, -1) @ b                                   # (B, 3, 1)
-    eye = torch.eye(3, device=A.device, dtype=A.dtype).unsqueeze(0)
-    # K'nin olcegi (odak uzakligi tipik olarak yuzlerce/binlerce piksel) AtA'nin
-    # mutlak buyuklugunu de o olcude buyuttugu icin SABIT kucuk bir ridge (ornegin
-    # 1e-3) ihmal edilebilir kalir ve sistemi stabilize etmez. Bunun yerine
-    # AtA'nin kendi olcegine GORECELI bir ridge kullaniyoruz (Tikhonov, olcek-
-    # bagimsiz), boylece her K/goruntu boyutu icin anlamli bir stabilizasyon
-    # sağlanir.
-    diag_scale = AtA.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-8)  # (B,1)
-    rel_ridge = (ridge * diag_scale).unsqueeze(-1)                  # (B,1,1)
-    sol = torch.linalg.solve(AtA + rel_ridge * eye, Atb)            # (B, 3, 1)
-    return sol.squeeze(-1)
+        b_u = u * M[..., 2] - M[..., 0]       # (B, N)
+        b_v = v * M[..., 2] - M[..., 1]       # (B, N)
+        b = torch.cat([b_u, b_v], dim=1).unsqueeze(-1)   # (B, 2N, 1)
+
+        AtA = A.transpose(-2, -1) @ A                                   # (B, 3, 3)
+        Atb = A.transpose(-2, -1) @ b                                   # (B, 3, 1)
+        eye = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0)
+
+        diag_scale = AtA.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-8)  # (B,1)
+        rel_ridge = (ridge * diag_scale).unsqueeze(-1)                  # (B,1,1)
+        sol = torch.linalg.solve(AtA + rel_ridge * eye, Atb)            # (B, 3, 1)
+        return sol.squeeze(-1).to(dtype=orig_dtype)
 
 
 def reproject_points(R: torch.Tensor, t: torch.Tensor, K: torch.Tensor, points_3d: torch.Tensor) -> torch.Tensor:
-    """R:(B,3,3) t:(B,3) K:(3,3)/(B,3,3) points_3d:(N,3)/(B,N,3) -> (B,N,2) piksel.
+    """R:(B,3,3) t:(B,3) K:(3,3)/(B,3,3) points_3d:(N,3)/(B,N,3) -> (B,N,2) piksel."""
+    orig_dtype = R.dtype
+    device = R.device
+    with torch.autocast(device_type=device.type, enabled=False):
+        R_f, t_f, K_f, p3d_f = R.float(), t.float(), K.float(), points_3d.float()
+        B = R_f.shape[0]
+        if K_f.dim() == 2:
+            K_f = K_f.unsqueeze(0).expand(B, -1, -1)
+        if p3d_f.dim() == 2:
+            p3d_f = p3d_f.unsqueeze(0).expand(B, -1, -1)
 
-    ONEMLI KONVANSIYON: Buradaki R, DUNYA-DAN-KAMERAYA (world-to-camera)
-    rotasyonudur: X_cam = R @ X_world + t. BU, LandNet'in ogrendigi/cikardigi
-    R (Rz(yaw)@Ry(pitch)@Rx(roll), yani UCAK GOVDESI-NDEN-DUNYAYA/attitude
-    konvansiyonu) ile AYNI DEGILDIR -- attitude R'nin TERSI (rotasyon
-    matrisleri icin transpozu = tersi) world-to-camera'ya karsilik gelir
-    (kamera govdeyle hizali/mounting-offset'siz varsayimiyla). Bu yuzden
-    LandNetLoss.forward() ve refine_rotation() bu fonksiyonu cagirirken
-    HER ZAMAN R_attitude.transpose(-2,-1) gecirir -- dogrudan R_attitude
-    DEGIL. Bu fonksiyonun kendisi jenerik/standart PnP konvansiyonunda
-    kalir, donusum cagiran taraftadir."""
-    B = R.shape[0]
-    if K.dim() == 2:
-        K = K.unsqueeze(0).expand(B, -1, -1)
-    if points_3d.dim() == 2:
-        points_3d = points_3d.unsqueeze(0).expand(B, -1, -1)
-
-    cam_pts = torch.einsum("bij,bnj->bni", R, points_3d) + t.unsqueeze(1)   # (B,N,3)
-    proj = torch.einsum("bij,bnj->bni", K, cam_pts)                          # (B,N,3)
-    uv = proj[..., :2] / proj[..., 2:3].clamp_min(1e-6)
-    return uv
+        cam_pts = torch.einsum("bij,bnj->bni", R_f, p3d_f) + t_f.unsqueeze(1)   # (B,N,3)
+        proj = torch.einsum("bij,bnj->bni", K_f, cam_pts)                          # (B,N,3)
+        uv = proj[..., :2] / proj[..., 2:3].clamp_min(1e-6)
+        return uv.to(dtype=orig_dtype)
 
 
 def reprojection_error(R: torch.Tensor, K: torch.Tensor, points_3d: torch.Tensor,
                         points_2d_gt: torch.Tensor, img_diag: Optional[torch.Tensor] = None
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """R sabitken t'yi kapali-form cozer, reproject eder ve piksel hatasini
-    dondurur. img_diag verilirse hata ona bolunerek olcek-bagimsiz hale gelir.
-    Donus: (per_point_error (B,N), t (B,3))"""
-    t = solve_translation_given_rotation(R, K, points_3d, points_2d_gt)
-    proj = reproject_points(R, t, K, points_3d)
-    err = (proj - points_2d_gt).norm(dim=-1)   # (B, N) -- piksel L2 hatasi
-    if img_diag is not None:
-        err = err / img_diag.unsqueeze(-1)
-    return err, t
+    """R sabitken t'yi kapali-form cozer, reproject eder ve piksel hatasini dondurur."""
+    orig_dtype = R.dtype
+    device = R.device
+    with torch.autocast(device_type=device.type, enabled=False):
+        R_f, K_f, p3d_f, p2d_f = R.float(), K.float(), points_3d.float(), points_2d_gt.float()
+        diag_f = img_diag.float() if img_diag is not None else None
+        t_f = solve_translation_given_rotation(R_f, K_f, p3d_f, p2d_f)
+        proj = reproject_points(R_f, t_f, K_f, p3d_f)
+        err = (proj - p2d_f).norm(dim=-1)   # (B, N)
+        if diag_f is not None:
+            err = err / diag_f.unsqueeze(-1)
+        return err.to(dtype=orig_dtype), t_f.to(dtype=orig_dtype)
 
 
 # =============================================================================
