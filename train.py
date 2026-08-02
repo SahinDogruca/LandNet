@@ -1,11 +1,18 @@
 """
-train.py — LandNet egitim dongusu.
+train.py — LandNet egitim dongusu (Multi-GPU DDP destekli).
 
 Hedef: pitch/yaw/roll icin cok yuksek dogruluk (hedef egitim RMSE ~0.001
 derece, gercek dunya/val performansinda ~0.01 derece civarina ulasmak icin).
-RTX 4070 Super (12GB VRAM) icin varsayilan degerlerle optimize edilmistir;
-300 epoch gibi uzun kosular icin (checkpoint/resume, EMA, warmup+cosine LR,
-gradient accumulation) tasarlanmistir.
+
+============================ CIFT GPU KULLANIMI ============================
+Kaggle T4x2 ya da birden fazla GPU icin:
+    torchrun --nproc_per_node=2 train.py --table_path ... --runway_db_path ...
+
+Tek GPU icin her zamanki gibi:
+    python train.py --table_path ... --runway_db_path ...
+
+Script otomatik olarak DDP'yi algilar (torchrun ortam degiskenleri) ve
+uygun moda gecer. Tek GPU'da hicbir DDP yukü yoktur.
 
 ============================ KULLANIMDAN ONCE ============================
 1) EGITIME BASLAMADAN ONCE mutlaka calistirin:
@@ -13,23 +20,27 @@ gradient accumulation) tasarlanmistir.
    Bu, aci konvansiyonu varsayimini (pitch offset=90) ve runway DB kapsamasini
    raporlar. pitch_raw ortalamasi ~90'dan uzaksa DURUN ve
    landnet.LARD_ANGLE_OFFSETS_DEG'i (ya da TrainConfig.angle_offsets'i)
-   duzeltmeden devam ETMEYIN -- yanlis konvansiyonla egitilen model, ne kadar
-   uzun egitilirse egitilsin SISTEMATIK olarak yanlis ogrenir.
+   duzeltmeden devam ETMEYIN.
 
-2) Ornek calistirma:
-       python train.py --table_path data/train.parquet \\
+2) Ornek calistirma (tek GPU):
+       python train.py --table_path lard_xplane_train.parquet \\
                         --runway_db_path runways_db_V2_XPlane.json \\
                         --output_dir runs/landnet_v1 \\
                         --img_size 640 --batch_size 8 --grad_accum_steps 2 \\
                         --epochs 300
 
-3) 12GB VRAM icin batch_size/img_size rehberi (yaklasik, GPU'ya gore degisebilir):
+3) Ornek calistirma (Kaggle T4x2):
+       torchrun --nproc_per_node=2 train.py \\
+                --table_path lard_xplane_train.parquet \\
+                --runway_db_path runways_db_V2_XPlane.json \\
+                --output_dir runs/landnet_v1 \\
+                --img_size 640 --batch_size 8 --grad_accum_steps 1 \\
+                --epochs 300
+
+4) 12GB VRAM icin batch_size/img_size rehberi (yaklasik, GPU'ya gore degisebilir):
        img_size=640,  batch_size=8-12,  grad_accum_steps=1-2  (use_grad_checkpoint=False)
        img_size=1024, batch_size=2-4,   grad_accum_steps=4-8  (use_grad_checkpoint=True onerilir)
-   Efektif batch_size = batch_size * grad_accum_steps; BatchNorm YERINE
-   GroupNorm kullanildigi icin (bkz. landnet.py) kucuk fiziksel batch_size
-   ISTIKRARI BOZMAZ -- ama optimizer gradyan gurultusu icin yine de efektif
-   batch_size'i makul (>=16) tutmak onerilir.
+   Efektif batch_size = batch_size * grad_accum_steps * world_size
 =============================================================================
 """
 
@@ -45,7 +56,10 @@ from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from landnet import (
@@ -69,7 +83,7 @@ class TrainConfig:
     images_root: Optional[str] = None   # 'image' sutunu goreli yol ise kok dizin
 
     batch_size: int = 8
-    grad_accum_steps: int = 2          # efektif batch = batch_size * grad_accum_steps
+    grad_accum_steps: int = 2          # efektif batch = batch_size * grad_accum_steps * world_size
     num_workers: int = 8
     val_fraction: float = 0.12
 
@@ -109,6 +123,53 @@ class TrainConfig:
 
 
 # =============================================================================
+# 0b) DDP yardimci fonksiyonlari
+# =============================================================================
+
+def setup_ddp() -> tuple:
+    """torchrun tarafindan ayarlanan ortam degiskenlerinden DDP baslatir.
+    Donus: (rank, local_rank, world_size, is_ddp)
+    torchrun OLMADAN calistirilirsa: (0, 0, 1, False) dondurur (tek GPU/CPU modu)."""
+    if "RANK" not in os.environ:
+        return 0, 0, 1, False
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+
+    return rank, local_rank, world_size, True
+
+
+def cleanup_ddp():
+    """DDP islem grubunu temizle."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main(rank: int) -> bool:
+    """Ana islem mi (rank 0)? Sadece rank 0 loglama/kaydetme/tqdm yapar."""
+    return rank == 0
+
+
+def log_print(msg: str, rank: int, use_tqdm: bool = True):
+    """Sadece rank 0'da yazdiran yardimci. tqdm aktifse tqdm.write kullanir."""
+    if not is_main(rank):
+        return
+    if use_tqdm:
+        tqdm.write(msg)
+    else:
+        print(msg)
+
+
+def _get_bare_model(model: nn.Module) -> nn.Module:
+    """DDP ile sarili modelden orijinal modeli cikarir."""
+    return model.module if isinstance(model, DDP) else model
+
+
+# =============================================================================
 # 1) EMA -- NaN/Inf'e karsi korumali (bkz. kullanicinin gecmis LandNet
 #    denemelerinde yasadigi "EMA weight contamination from NaN events" sorunu)
 # =============================================================================
@@ -117,7 +178,10 @@ class SafeEMA:
     """Standart EMA, TEK farkla: her guncellemeden once ilgili tensorun
     SONLU (finite) oldugu kontrol edilir. Bozuk (NaN/Inf) bir agirlik ASLA
     EMA golgesine karismaz -- bozuk adim sessizce atlanir, EMA bir onceki
-    saglikli durumunu korur."""
+    saglikli durumunu korur.
+
+    DDP notu: EMA, SADECE rank 0'da tutulur/guncellenir. DDP surasi ile
+    _get_bare_model() araciligiyla orijinal modelden state_dict alinir."""
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
@@ -126,7 +190,8 @@ class SafeEMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        sd = model.state_dict()
+        bare = _get_bare_model(model)
+        sd = bare.state_dict()
         for k, v in sd.items():
             if not torch.is_floating_point(v):
                 self.shadow[k] = v.detach().clone()
@@ -137,7 +202,8 @@ class SafeEMA:
             self.shadow[k].mul_(self.decay).add_(v.detach().to(self.shadow[k].dtype), alpha=1 - self.decay)
 
     def copy_to(self, model: nn.Module):
-        model.load_state_dict(self.shadow, strict=True)
+        bare = _get_bare_model(model)
+        bare.load_state_dict(self.shadow, strict=True)
 
     def state_dict(self):
         return self.shadow
@@ -174,22 +240,25 @@ def _to_device(batch: Dict, device, non_blocking: bool = True) -> Dict:
 
 # =============================================================================
 # 4) Validasyon dongusu (ham + istege bagli post-hoc refinement)
+#    DDP: sadece rank 0 validate eder (rank 1+ barrier'da bekler)
 # =============================================================================
 
 @torch.no_grad()
 def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, device,
              amp_dtype: torch.dtype, run_refinement: bool = False,
-             refine_max_batches: int = 4) -> Dict[str, float]:
-    model.eval()
+             refine_max_batches: int = 4, rank: int = 0) -> Dict[str, float]:
+    bare_model = _get_bare_model(model)
+    bare_model.eval()
     raw_logger = PoseMetricLogger()
     refined_logger = PoseMetricLogger() if run_refinement else None
     total_loss, total_loss_rot, total_loss_reproj, n_batches = 0.0, 0.0, 0.0, 0
 
-    pbar = tqdm(loader, desc="  [val]", leave=False, dynamic_ncols=True)
+    pbar = tqdm(loader, desc="  [val]", leave=False, dynamic_ncols=True,
+                disable=not is_main(rank), mininterval=30)
     for bi, batch in enumerate(pbar):
         batch = _to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
-            pred = model(batch["image"])
+            pred = bare_model(batch["image"])
             out = criterion(pred, batch["R_gt"], K=batch["K"], points_3d=batch["points_3d"],
                              points_2d_gt=batch["points_2d_gt"], img_diag=batch["img_diag"])
 
@@ -223,17 +292,27 @@ def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, devic
 
 
 # =============================================================================
-# 5) Ana egitim dongusu
+# 5) Ana egitim dongusu (DDP-uyumlu)
 # =============================================================================
 
 def train(cfg: TrainConfig):
-    os.makedirs(cfg.output_dir, exist_ok=True)
-    with open(os.path.join(cfg.output_dir, "train_config.json"), "w") as f:
-        json.dump(asdict(cfg), f, indent=2, ensure_ascii=False)
+    # --- DDP baslat ---
+    rank, local_rank, world_size, is_ddp = setup_ddp()
 
-    torch.manual_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Cihaz: {device}")
+    if is_main(rank):
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        with open(os.path.join(cfg.output_dir, "train_config.json"), "w") as f:
+            json.dump(asdict(cfg), f, indent=2, ensure_ascii=False)
+
+    torch.manual_seed(cfg.seed + rank)  # her rank'a farkli seed (veri augmentasyonu icin)
+
+    if is_ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    log_print(f"Cihaz: {device} (rank={rank}, world_size={world_size}, ddp={is_ddp})", rank, use_tqdm=False)
+
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = cfg.allow_tf32
         torch.backends.cudnn.allow_tf32 = cfg.allow_tf32
@@ -241,29 +320,38 @@ def train(cfg: TrainConfig):
 
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
 
-    # --- Veri kumesi: dosya yoksa HuggingFace'ten otomatik indir ---
+    # --- Veri kumesi: dosya yoksa HuggingFace'ten otomatik indir (sadece rank 0) ---
     data_cfg = DataConfig(
         table_path=cfg.table_path, runway_db_path=cfg.runway_db_path,
         images_root=cfg.images_root,
         img_size=cfg.img_size, hfov_deg=cfg.hfov_deg, val_fraction=cfg.val_fraction,
         split_seed=cfg.seed, angle_offsets=cfg.angle_offsets,
     )
-    # Dosya yoksa HuggingFace'ten indir (DataConfig.auto_download_from_hf=True ise)
-    from landnet_data import _ensure_table_exists
-    resolved_table_path = _ensure_table_exists(data_cfg)
 
-    # --- ACI KONVANSIYONU + RUNWAY DB KAPSAMA raporlanir (guvenlik) ---
-    print("\n[1/5] Aci konvansiyonu ve runway DB kapsama kontrolleri calistiriliyor...")
-    sanity_check_angle_convention(resolved_table_path)
-    report_runway_db_coverage(resolved_table_path, cfg.runway_db_path)
+    if is_main(rank):
+        from landnet_data import _ensure_table_exists
+        resolved_table_path = _ensure_table_exists(data_cfg)
+        # ACI KONVANSIYONU + RUNWAY DB KAPSAMA raporlanir (sadece rank 0)
+        print("\n[1/5] Aci konvansiyonu ve runway DB kapsama kontrolleri calistiriliyor...")
+        sanity_check_angle_convention(resolved_table_path)
+        report_runway_db_coverage(resolved_table_path, cfg.runway_db_path)
+    if is_ddp:
+        dist.barrier()  # rank 0 indirme/kontrol bitene kadar bekle
 
     train_ds = LARDPoseDataset(data_cfg, split="train")
     val_ds = LARDPoseDataset(data_cfg, split="val")
-    print(f"[2/5] Veri kumesi: train={len(train_ds)}  val={len(val_ds)}")
+    log_print(f"[2/5] Veri kumesi: train={len(train_ds)}  val={len(val_ds)}", rank, use_tqdm=False)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                               num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-                               persistent_workers=(cfg.num_workers > 0))
+    # --- DataLoader: DDP'de DistributedSampler, tek GPU'da shuffle ---
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size,
+        shuffle=(train_sampler is None),  # DistributedSampler varsa shuffle=False olmali
+        sampler=train_sampler,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=(cfg.num_workers > 0),
+    )
+    # Val: sadece rank 0 validate edecek, DistributedSampler gereksiz
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                              num_workers=cfg.num_workers, pin_memory=True,
                              persistent_workers=(cfg.num_workers > 0))
@@ -272,14 +360,20 @@ def train(cfg: TrainConfig):
                                use_grad_checkpoint=cfg.use_grad_checkpoint)
     model = LandNet(model_cfg).to(device)
     criterion = LandNetLoss(model_cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[3/5] LandNet parametre sayisi: {n_params / 1e6:.2f}M")
+
+    # --- DDP: modeli sar ---
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+
+    bare_model = _get_bare_model(model)
+    n_params = sum(p.numel() for p in bare_model.parameters())
+    log_print(f"[3/5] LandNet parametre sayisi: {n_params / 1e6:.2f}M", rank, use_tqdm=False)
 
     # --- Discriminative LR (istege bagli): rotation_head her zaman tam LR, govde carpan ile ---
     if cfg.backbone_lr_mult != 1.0:
-        head_params = list(model.rotation_head.parameters())
+        head_params = list(bare_model.rotation_head.parameters())
         head_ids = {id(p) for p in head_params}
-        backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
+        backbone_params = [p for p in bare_model.parameters() if id(p) not in head_ids]
         param_groups = [
             {"params": backbone_params, "lr": cfg.lr * cfg.backbone_lr_mult},
             {"params": head_params, "lr": cfg.lr},
@@ -296,14 +390,14 @@ def train(cfg: TrainConfig):
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda_factory(total_steps, warmup_steps, cfg.lr_floor_mult))
 
-    ema = SafeEMA(model, decay=cfg.ema_decay) if cfg.use_ema else None
+    ema = SafeEMA(bare_model, decay=cfg.ema_decay) if (cfg.use_ema and is_main(rank)) else None
 
     start_epoch = 0
     best_val_geodesic = float("inf")
     if cfg.resume_from is not None and os.path.exists(cfg.resume_from):
-        print(f"[4/5] Checkpoint'ten devam ediliyor: {cfg.resume_from}")
+        log_print(f"[4/5] Checkpoint'ten devam ediliyor: {cfg.resume_from}", rank, use_tqdm=False)
         ckpt = torch.load(cfg.resume_from, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        bare_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         criterion.load_state_dict(ckpt["criterion"])
@@ -312,25 +406,36 @@ def train(cfg: TrainConfig):
         start_epoch = ckpt["epoch"] + 1
         best_val_geodesic = ckpt.get("best_val_geodesic", float("inf"))
     else:
-        print("[4/5] Sifirdan egitim baslatiliyor.")
+        log_print("[4/5] Sifirdan egitim baslatiliyor.", rank, use_tqdm=False)
 
     history_path = os.path.join(cfg.output_dir, "history.jsonl")
-    print(f"[5/5] Egitim basliyor: {cfg.epochs} epoch, {steps_per_epoch} adim/epoch "
-          f"(efektif batch={cfg.batch_size * cfg.grad_accum_steps})\n")
+    eff_batch = cfg.batch_size * cfg.grad_accum_steps * world_size
+    log_print(f"[5/5] Egitim basliyor: {cfg.epochs} epoch, {steps_per_epoch} adim/epoch "
+              f"(efektif batch={eff_batch}, world_size={world_size})\n", rank, use_tqdm=False)
 
     global_step = start_epoch * steps_per_epoch
-    epoch_pbar = tqdm(range(start_epoch, cfg.epochs), desc="Epoch", dynamic_ncols=True)
+
+    # tqdm SADECE rank 0'da gosterilir
+    epoch_pbar = tqdm(range(start_epoch, cfg.epochs), desc="Epoch",
+                      dynamic_ncols=True, disable=not is_main(rank),
+                      mininterval=60)
     for epoch in epoch_pbar:
         model.train()
         epoch_t0 = time.time()
         use_reproj_this_epoch = epoch >= cfg.reproj_warmup_epochs
 
+        # DDP: her epoch'ta sampler'a epoch bildir (veri karistirma icin)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         running_loss, running_rot, running_reproj = 0.0, 0.0, 0.0
         n_finite_steps, n_skipped_steps = 0, 0
 
         optimizer.zero_grad(set_to_none=True)
-        batch_pbar = tqdm(train_loader, desc=f"  Epoch {epoch}", leave=False, dynamic_ncols=True)
-        for step, batch in enumerate(batch_pbar):
+        n_total_batches = len(train_loader)
+        log_interval = max(1, n_total_batches // 4)  # epoch icinde %25'te bir ilerleme bas
+
+        for step, batch in enumerate(train_loader):
             batch = _to_device(batch, device)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
@@ -352,9 +457,19 @@ def train(cfg: TrainConfig):
             loss.backward()
 
             if (step + 1) % cfg.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                # DDP: criterion parametrelerinin (s_r, s_p) gradyanlarini
+                # tum rank'lar arasinda ORTALA (DDP sadece model gradyanlarini
+                # otomatik senkronize eder, criterion ayri module)
+                if is_ddp:
+                    for p in criterion.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+                # Hem model hem criterion parametrelerini kliple
+                all_params = list(model.parameters()) + list(criterion.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, cfg.grad_clip_norm)
                 grad_finite = all(
-                    torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None
+                    torch.isfinite(p.grad).all() for p in all_params if p.grad is not None
                 )
                 if grad_finite:
                     optimizer.step()
@@ -371,10 +486,13 @@ def train(cfg: TrainConfig):
             running_rot += out["loss_rotation"].item()
             running_reproj += out.get("loss_reprojection", torch.tensor(0.0)).item()
 
-            # tqdm postfix guncelle
-            avg_loss = running_loss / (step + 1)
-            avg_rot = running_rot / (step + 1)
-            batch_pbar.set_postfix(loss=f"{avg_loss:.4f}", rot=f"{avg_rot:.4f}", skip=n_skipped_steps)
+            # Epoch icerisinde %25/%50/%75'te kisa ilerleme satiri
+            if is_main(rank) and (step + 1) % log_interval == 0:
+                pct = 100 * (step + 1) / n_total_batches
+                avg_loss = running_loss / (step + 1)
+                avg_rot = running_rot / (step + 1)
+                log_print(f"    [{pct:3.0f}%] step {step+1}/{n_total_batches} "
+                          f"loss={avg_loss:.4f} rot={avg_rot:.4f} skip={n_skipped_steps}", rank)
 
         n_batches = len(train_loader)
         train_metrics = {
@@ -387,54 +505,66 @@ def train(cfg: TrainConfig):
             "lr": scheduler.get_last_lr()[0],
             "epoch_time_sec": time.time() - epoch_t0,
         }
-        epoch_pbar.set_postfix(
-            loss=f"{train_metrics['train_loss']:.4f}",
-            rot=f"{train_metrics['train_loss_rotation']:.4f}",
-            lr=f"{train_metrics['lr']:.1e}",
-            t=f"{train_metrics['epoch_time_sec']:.0f}s",
-        )
-        tqdm.write(f"[epoch {epoch:4d}/{cfg.epochs}] loss={train_metrics['train_loss']:.6f} "
+        if is_main(rank):
+            epoch_pbar.set_postfix(
+                loss=f"{train_metrics['train_loss']:.4f}",
+                rot=f"{train_metrics['train_loss_rotation']:.4f}",
+                lr=f"{train_metrics['lr']:.1e}",
+                t=f"{train_metrics['epoch_time_sec']:.0f}s",
+            )
+        log_print(f"[epoch {epoch:4d}/{cfg.epochs}] loss={train_metrics['train_loss']:.6f} "
               f"rot={train_metrics['train_loss_rotation']:.6f} "
               f"reproj={train_metrics['train_loss_reprojection']:.6f} "
               f"(aktif={use_reproj_this_epoch}) lr={train_metrics['lr']:.2e} "
-              f"atlanan_adim={n_skipped_steps} sure={train_metrics['epoch_time_sec']:.1f}s")
+              f"atlanan_adim={n_skipped_steps} sure={train_metrics['epoch_time_sec']:.1f}s", rank)
 
         log_entry = dict(train_metrics)
 
+        # --- Validasyon: SADECE rank 0 yapar, diger rank'lar barrier'da bekler ---
         if (epoch + 1) % cfg.val_every == 0 or epoch == cfg.epochs - 1:
-            run_refine = ((epoch + 1) % cfg.refine_eval_every == 0) or (epoch == cfg.epochs - 1)
-            val_metrics = validate(model, criterion, val_loader, device, amp_dtype,
-                                    run_refinement=run_refine, refine_max_batches=cfg.refine_eval_max_batches)
-            tqdm.write(f"  [val] loss={val_metrics['val_loss']:.6f} "
-                  f"geodesic_MAE={val_metrics['raw_geodesic_mae_deg']:.4f} deg "
-                  f"geodesic_RMSE={val_metrics['raw_geodesic_rmse_deg']:.4f} deg")
-            tqdm.write(f"        yaw_RMSE={val_metrics['raw_yaw_rmse_deg']:.4f} "
-                  f"pitch_RMSE={val_metrics['raw_pitch_rmse_deg']:.4f} "
-                  f"roll_RMSE={val_metrics['raw_roll_rmse_deg']:.4f} (derece)")
-            if run_refine:
-                tqdm.write(f"  [val+refine] geodesic_RMSE={val_metrics['refined_geodesic_rmse_deg']:.4f} deg "
-                      f"(ham modelden fark: "
-                      f"{val_metrics['raw_geodesic_rmse_deg'] - val_metrics['refined_geodesic_rmse_deg']:+.4f} deg)")
-            log_entry.update(val_metrics)
+            if is_main(rank):
+                run_refine = ((epoch + 1) % cfg.refine_eval_every == 0) or (epoch == cfg.epochs - 1)
+                val_metrics = validate(model, criterion, val_loader, device, amp_dtype,
+                                        run_refinement=run_refine,
+                                        refine_max_batches=cfg.refine_eval_max_batches,
+                                        rank=rank)
+                log_print(f"  [val] loss={val_metrics['val_loss']:.6f} "
+                      f"geodesic_MAE={val_metrics['raw_geodesic_mae_deg']:.4f} deg "
+                      f"geodesic_RMSE={val_metrics['raw_geodesic_rmse_deg']:.4f} deg", rank)
+                log_print(f"        yaw_RMSE={val_metrics['raw_yaw_rmse_deg']:.4f} "
+                      f"pitch_RMSE={val_metrics['raw_pitch_rmse_deg']:.4f} "
+                      f"roll_RMSE={val_metrics['raw_roll_rmse_deg']:.4f} (derece)", rank)
+                if run_refine:
+                    log_print(f"  [val+refine] geodesic_RMSE={val_metrics['refined_geodesic_rmse_deg']:.4f} deg "
+                          f"(ham modelden fark: "
+                          f"{val_metrics['raw_geodesic_rmse_deg'] - val_metrics['refined_geodesic_rmse_deg']:+.4f} deg)", rank)
+                log_entry.update(val_metrics)
 
-            if val_metrics["raw_geodesic_rmse_deg"] < best_val_geodesic:
-                best_val_geodesic = val_metrics["raw_geodesic_rmse_deg"]
-                _save_checkpoint(cfg, model, optimizer, scheduler, criterion, ema, epoch,
-                                  best_val_geodesic, os.path.join(cfg.output_dir, "best.pt"))
-                tqdm.write(f"  -> YENI EN IYI model kaydedildi (geodesic_RMSE={best_val_geodesic:.4f} deg)")
+                if val_metrics["raw_geodesic_rmse_deg"] < best_val_geodesic:
+                    best_val_geodesic = val_metrics["raw_geodesic_rmse_deg"]
+                    _save_checkpoint(cfg, bare_model, optimizer, scheduler, criterion, ema, epoch,
+                                      best_val_geodesic, os.path.join(cfg.output_dir, "best.pt"))
+                    log_print(f"  -> YENI EN IYI model kaydedildi (geodesic_RMSE={best_val_geodesic:.4f} deg)", rank)
+            if is_ddp:
+                dist.barrier()  # rank 0 val bitene kadar bekle
 
-        with open(history_path, "a") as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        # --- Loglama ve periyodik kaydetme (sadece rank 0) ---
+        if is_main(rank):
+            with open(history_path, "a") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
-        if (epoch + 1) % cfg.save_every == 0 or epoch == cfg.epochs - 1:
-            _save_checkpoint(cfg, model, optimizer, scheduler, criterion, ema, epoch,
-                              best_val_geodesic, os.path.join(cfg.output_dir, "last.pt"))
+            if (epoch + 1) % cfg.save_every == 0 or epoch == cfg.epochs - 1:
+                _save_checkpoint(cfg, bare_model, optimizer, scheduler, criterion, ema, epoch,
+                                  best_val_geodesic, os.path.join(cfg.output_dir, "last.pt"))
 
-    print(f"\nEgitim tamamlandi. En iyi val geodesic RMSE: {best_val_geodesic:.4f} derece.")
-    print(f"En iyi model: {os.path.join(cfg.output_dir, 'best.pt')}")
+    log_print(f"\nEgitim tamamlandi. En iyi val geodesic RMSE: {best_val_geodesic:.4f} derece.", rank, use_tqdm=False)
+    log_print(f"En iyi model: {os.path.join(cfg.output_dir, 'best.pt')}", rank, use_tqdm=False)
+
+    cleanup_ddp()
 
 
 def _save_checkpoint(cfg, model, optimizer, scheduler, criterion, ema, epoch, best_val_geodesic, path):
+    """Checkpoint kaydeder. model, DDP-OLMAYAN (bare) model olmalidir."""
     ckpt = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
