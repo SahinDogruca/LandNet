@@ -246,15 +246,16 @@ def _to_device(batch: Dict, device, non_blocking: bool = True) -> Dict:
 @torch.no_grad()
 def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, device,
              amp_dtype: torch.dtype, run_refinement: bool = False,
-             refine_max_batches: int = 4, rank: int = 0) -> Dict[str, float]:
+             refine_max_batches: int = 4, rank: int = 0,
+             desc_suffix: str = "Val") -> Dict[str, float]:
     bare_model = _get_bare_model(model)
     bare_model.eval()
     raw_logger = PoseMetricLogger()
     refined_logger = PoseMetricLogger() if run_refinement else None
     total_loss, total_loss_rot, total_loss_reproj, n_batches = 0.0, 0.0, 0.0, 0
 
-    pbar = tqdm(loader, desc="  [val]", leave=False, dynamic_ncols=True,
-                disable=not is_main(rank), mininterval=30)
+    pbar = tqdm(loader, desc=f"  [{desc_suffix}]", leave=False, dynamic_ncols=True,
+                disable=not is_main(rank))
     for bi, batch in enumerate(pbar):
         batch = _to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
@@ -262,12 +263,14 @@ def validate(model: nn.Module, criterion: LandNetLoss, loader: DataLoader, devic
             out = criterion(pred, batch["R_gt"], K=batch["K"], points_3d=batch["points_3d"],
                              points_2d_gt=batch["points_2d_gt"], img_diag=batch["img_diag"])
 
-        total_loss += out["loss"].item()
+        l_val = out["loss"].item()
+        total_loss += l_val
         total_loss_rot += out["loss_rotation"].item()
         total_loss_reproj += out.get("loss_reprojection", torch.tensor(0.0)).item()
         n_batches += 1
 
         raw_logger.update(pred["R"].float(), batch["R_gt"].float())
+        pbar.set_postfix(loss=f"{total_loss / max(1, n_batches):.4f}")
 
         if run_refinement and bi < refine_max_batches:
             # Not: refine_rotation icsel olarak autograd kullanir (Adam),
@@ -415,11 +418,8 @@ def train(cfg: TrainConfig):
 
     global_step = start_epoch * steps_per_epoch
 
-    # tqdm SADECE rank 0'da gosterilir
-    epoch_pbar = tqdm(range(start_epoch, cfg.epochs), desc="Epoch",
-                      dynamic_ncols=True, disable=not is_main(rank),
-                      mininterval=60)
-    for epoch in epoch_pbar:
+    # Outer loop has NO tqdm wrapper (user request: 300 epochs is long, no outer tqdm)
+    for epoch in range(start_epoch, cfg.epochs):
         model.train()
         epoch_t0 = time.time()
         use_reproj_this_epoch = epoch >= cfg.reproj_warmup_epochs
@@ -432,10 +432,10 @@ def train(cfg: TrainConfig):
         n_finite_steps, n_skipped_steps = 0, 0
 
         optimizer.zero_grad(set_to_none=True)
-        n_total_batches = len(train_loader)
-        log_interval = max(1, n_total_batches // 4)  # epoch icinde %25'te bir ilerleme bas
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{cfg.epochs} [Train]",
+                          leave=False, dynamic_ncols=True, disable=not is_main(rank))
 
-        for step, batch in enumerate(train_loader):
+        for step, batch in enumerate(train_pbar):
             batch = _to_device(batch, device)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
@@ -447,9 +447,6 @@ def train(cfg: TrainConfig):
                 loss = out["loss"] / cfg.grad_accum_steps
 
             if not torch.isfinite(loss):
-                # Bozuk (NaN/Inf) bir adim -- optimizer.step()'e ASLA izin verme,
-                # gradyanlari temizle ve bu mini-batch'i atla (kullanicinin gecmiste
-                # yasadigi NaN-kaynakli sorunlara karsi savunma).
                 n_skipped_steps += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
@@ -457,15 +454,11 @@ def train(cfg: TrainConfig):
             loss.backward()
 
             if (step + 1) % cfg.grad_accum_steps == 0:
-                # DDP: criterion parametrelerinin (s_r, s_p) gradyanlarini
-                # tum rank'lar arasinda ORTALA (DDP sadece model gradyanlarini
-                # otomatik senkronize eder, criterion ayri module)
                 if is_ddp:
                     for p in criterion.parameters():
                         if p.grad is not None:
                             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-                # Hem model hem criterion parametrelerini kliple
                 all_params = list(model.parameters()) + list(criterion.parameters())
                 torch.nn.utils.clip_grad_norm_(all_params, cfg.grad_clip_norm)
                 grad_finite = all(
@@ -486,13 +479,11 @@ def train(cfg: TrainConfig):
             running_rot += out["loss_rotation"].item()
             running_reproj += out.get("loss_reprojection", torch.tensor(0.0)).item()
 
-            # Epoch icerisinde %25/%50/%75'te kisa ilerleme satiri
-            if is_main(rank) and (step + 1) % log_interval == 0:
-                pct = 100 * (step + 1) / n_total_batches
-                avg_loss = running_loss / (step + 1)
-                avg_rot = running_rot / (step + 1)
-                log_print(f"    [{pct:3.0f}%] step {step+1}/{n_total_batches} "
-                          f"loss={avg_loss:.4f} rot={avg_rot:.4f} skip={n_skipped_steps}", rank)
+            train_pbar.set_postfix(
+                loss=f"{running_loss / (step + 1):.4f}",
+                rot=f"{running_rot / (step + 1):.4f}",
+                skip=n_skipped_steps,
+            )
 
         n_batches = len(train_loader)
         train_metrics = {
@@ -505,51 +496,90 @@ def train(cfg: TrainConfig):
             "lr": scheduler.get_last_lr()[0],
             "epoch_time_sec": time.time() - epoch_t0,
         }
-        if is_main(rank):
-            epoch_pbar.set_postfix(
-                loss=f"{train_metrics['train_loss']:.4f}",
-                rot=f"{train_metrics['train_loss_rotation']:.4f}",
-                lr=f"{train_metrics['lr']:.1e}",
-                t=f"{train_metrics['epoch_time_sec']:.0f}s",
-            )
-        log_print(f"[epoch {epoch:4d}/{cfg.epochs}] loss={train_metrics['train_loss']:.6f} "
-              f"rot={train_metrics['train_loss_rotation']:.6f} "
-              f"reproj={train_metrics['train_loss_reprojection']:.6f} "
-              f"(aktif={use_reproj_this_epoch}) lr={train_metrics['lr']:.2e} "
-              f"atlanan_adim={n_skipped_steps} sure={train_metrics['epoch_time_sec']:.1f}s", rank)
 
         log_entry = dict(train_metrics)
+        val_metrics = None
+        ema_val_metrics = None
+        is_best = False
 
-        # --- Validasyon: SADECE rank 0 yapar, diger rank'lar barrier'da bekler ---
+        # --- Validasyon ---
         if (epoch + 1) % cfg.val_every == 0 or epoch == cfg.epochs - 1:
             if is_main(rank):
                 run_refine = ((epoch + 1) % cfg.refine_eval_every == 0) or (epoch == cfg.epochs - 1)
+                # Model validation (leave=False tqdm progress bar inside validate)
                 val_metrics = validate(model, criterion, val_loader, device, amp_dtype,
                                         run_refinement=run_refine,
                                         refine_max_batches=cfg.refine_eval_max_batches,
-                                        rank=rank)
-                log_print(f"  [val] loss={val_metrics['val_loss']:.6f} "
-                      f"geodesic_MAE={val_metrics['raw_geodesic_mae_deg']:.4f} deg "
-                      f"geodesic_RMSE={val_metrics['raw_geodesic_rmse_deg']:.4f} deg", rank)
-                log_print(f"        yaw_RMSE={val_metrics['raw_yaw_rmse_deg']:.4f} "
-                      f"pitch_RMSE={val_metrics['raw_pitch_rmse_deg']:.4f} "
-                      f"roll_RMSE={val_metrics['raw_roll_rmse_deg']:.4f} (derece)", rank)
-                if run_refine:
-                    log_print(f"  [val+refine] geodesic_RMSE={val_metrics['refined_geodesic_rmse_deg']:.4f} deg "
-                          f"(ham modelden fark: "
-                          f"{val_metrics['raw_geodesic_rmse_deg'] - val_metrics['refined_geodesic_rmse_deg']:+.4f} deg)", rank)
+                                        rank=rank, desc_suffix="Val")
                 log_entry.update(val_metrics)
 
-                if val_metrics["raw_geodesic_rmse_deg"] < best_val_geodesic:
-                    best_val_geodesic = val_metrics["raw_geodesic_rmse_deg"]
+                # EMA model validation (if active)
+                if ema is not None:
+                    # Evaluate EMA weights
+                    orig_sd = {k: v.cpu().clone() for k, v in bare_model.state_dict().items()}
+                    ema.copy_to(bare_model)
+                    ema_val_metrics = validate(bare_model, criterion, val_loader, device, amp_dtype,
+                                               run_refinement=False, rank=rank, desc_suffix="Val-EMA")
+                    # Restore original model weights
+                    bare_model.load_state_dict({k: v.to(device) for k, v in orig_sd.items()})
+                    log_entry.update({f"ema_{k}": v for k, v in ema_val_metrics.items()})
+
+                # Check best model saving
+                current_geo_rmse = val_metrics["raw_geodesic_rmse_deg"]
+                if ema_val_metrics and ema_val_metrics["raw_geodesic_rmse_deg"] < current_geo_rmse:
+                    current_geo_rmse = ema_val_metrics["raw_geodesic_rmse_deg"]
+
+                if current_geo_rmse < best_val_geodesic:
+                    best_val_geodesic = current_geo_rmse
+                    is_best = True
                     _save_checkpoint(cfg, bare_model, optimizer, scheduler, criterion, ema, epoch,
                                       best_val_geodesic, os.path.join(cfg.output_dir, "best.pt"))
-                    log_print(f"  -> YENI EN IYI model kaydedildi (geodesic_RMSE={best_val_geodesic:.4f} deg)", rank)
+
             if is_ddp:
                 dist.barrier()  # rank 0 val bitene kadar bekle
 
-        # --- Loglama ve periyodik kaydetme (sadece rank 0) ---
+        # --- DETAYLI METRİK ÇIKTISI (Sadece rank 0, Tqdm bar'ları silindikten sonra temiz çıktı) ---
         if is_main(rank):
+            print("=" * 80)
+            print(f"EPOCH [{epoch + 1:4d} / {cfg.epochs:4d}] | Sure: {train_metrics['epoch_time_sec']:.1f}s | "
+                  f"LR: {train_metrics['lr']:.2e} | Atlanan Adim: {n_skipped_steps} | "
+                  f"Reproj: {'Aktif' if use_reproj_this_epoch else 'Pasif'}")
+            print("-" * 80)
+            print(" KAYIPLAR (LOSSES):")
+            print(f"   Train -> Toplam: {train_metrics['train_loss']:.6f} | "
+                  f"Rot: {train_metrics['train_loss_rotation']:.6f} | "
+                  f"Reproj: {train_metrics['train_loss_reprojection']:.6f}")
+            if val_metrics:
+                print(f"   Val   -> Toplam: {val_metrics['val_loss']:.6f} | "
+                      f"Rot: {val_metrics['val_loss_rotation']:.6f} | "
+                      f"Reproj: {val_metrics['val_loss_reprojection']:.6f}")
+
+            if val_metrics:
+                print("\n ACI METRIKLERI [VAL MODEL]:")
+                print(f"   Yaw      -> MAE: {val_metrics['raw_yaw_mae_deg']:.4f}° | RMSE: {val_metrics['raw_yaw_rmse_deg']:.4f}°")
+                print(f"   Pitch    -> MAE: {val_metrics['raw_pitch_mae_deg']:.4f}° | RMSE: {val_metrics['raw_pitch_rmse_deg']:.4f}°")
+                print(f"   Roll     -> MAE: {val_metrics['raw_roll_mae_deg']:.4f}° | RMSE: {val_metrics['raw_roll_rmse_deg']:.4f}°")
+                print(f"   Geodesic -> MAE: {val_metrics['raw_geodesic_mae_deg']:.4f}° | RMSE: {val_metrics['raw_geodesic_rmse_deg']:.4f}°")
+
+            if ema_val_metrics:
+                print("\n ACI METRIKLERI [EMA VAL MODEL]:")
+                print(f"   Yaw      -> MAE: {ema_val_metrics['raw_yaw_mae_deg']:.4f}° | RMSE: {ema_val_metrics['raw_yaw_rmse_deg']:.4f}°")
+                print(f"   Pitch    -> MAE: {ema_val_metrics['raw_pitch_mae_deg']:.4f}° | RMSE: {ema_val_metrics['raw_pitch_rmse_deg']:.4f}°")
+                print(f"   Roll     -> MAE: {ema_val_metrics['raw_roll_mae_deg']:.4f}° | RMSE: {ema_val_metrics['raw_roll_rmse_deg']:.4f}°")
+                print(f"   Geodesic -> MAE: {ema_val_metrics['raw_geodesic_mae_deg']:.4f}° | RMSE: {ema_val_metrics['raw_geodesic_rmse_deg']:.4f}°")
+
+            if val_metrics and "refined_geodesic_rmse_deg" in val_metrics:
+                print("\n POST-HOC GEOMETRIK REFINEMENT:")
+                diff = val_metrics['raw_geodesic_rmse_deg'] - val_metrics['refined_geodesic_rmse_deg']
+                print(f"   Refined Geodesic RMSE: {val_metrics['refined_geodesic_rmse_deg']:.4f}° (Ham modele gore fark: {diff:+.4f}°)")
+                print(f"   Refined Yaw RMSE: {val_metrics.get('refined_yaw_rmse_deg', 0.0):.4f}° | "
+                      f"Pitch RMSE: {val_metrics.get('refined_pitch_rmse_deg', 0.0):.4f}° | "
+                      f"Roll RMSE: {val_metrics.get('refined_roll_rmse_deg', 0.0):.4f}°")
+
+            if is_best:
+                print(f"\n  ★ YENI EN IYI MODEL KAYDEDILDI (Val Geodesic RMSE: {best_val_geodesic:.4f}°)")
+            print("=" * 80 + "\n")
+
             with open(history_path, "a") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
